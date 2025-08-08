@@ -1,0 +1,47 @@
+# Output directories
+outputs/
+
+# Script directories
+scripts/
+
+# Weights & Biases
+wandb/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Data files
+*.pkl
+*.pth
+*.ckpt
+*.h5
+*.hdf5
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb

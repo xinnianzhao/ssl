@@ -1,0 +1,13 @@
+torch>=1.10.0
+torchaudio>=0.10.0
+transformers>=4.30.0
+datasets>=2.0.0
+evaluate>=0.4.0
+sentencepiece>=0.1.96
+numpy>=1.20.0
+wandb>=0.12.0
+soundfile>=0.12.1
+librosa>=0.9.0
+jiwer>=2.5.1
+tensorboard>=2.10.0
+accelerate>=0.20.0
