@@ -10,7 +10,7 @@ import re
 import sys
 import warnings
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union, Any
+from typing import Dict, List, Optional, Union, Any, Tuple
 
 import datasets
 import evaluate
@@ -19,11 +19,15 @@ import pandas as pd
 import numpy as np
 from datasets import Dataset, DatasetDict
 from pathlib import Path
+try:
+    import yaml  # optional
+except Exception:
+    yaml = None
 
 import transformers
 from transformers import (
-    WavLMConfig,
-    WavLMForCTC,
+    Wav2Vec2Config,
+    Wav2Vec2ForCTC,
     Wav2Vec2FeatureExtractor,
     HfArgumentParser,
     Trainer,
@@ -51,6 +55,204 @@ logger = logging.getLogger(__name__)
 
 def list_field(default=None, metadata=None):
     return field(default_factory=lambda: default, metadata=metadata)
+
+
+def _is_espnet_ssl_checkpoint_dir(path_str: str) -> bool:
+    """Return True if directory looks like an ESPnet SSL checkpoint folder."""
+    p = Path(path_str)
+    if not p.is_dir():
+        return False
+    has_yaml = (p / "config.yaml").is_file()
+    has_pth = any(p.glob("*.pth"))
+    return has_yaml and has_pth
+
+
+def _load_yaml_or_empty(path: Path) -> Dict[str, Any]:
+    if yaml is None:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+
+def _init_wav2vec2_base_model(tokenizer, base_model_name: str, cache_dir: Optional[str], token: Optional[str], trust_remote_code: bool) -> Tuple[Wav2Vec2Config, Wav2Vec2ForCTC]:
+    """Create a HF Wav2Vec2ForCTC using a base HF checkpoint and adjust vocab-related fields."""
+    config = Wav2Vec2Config.from_pretrained(
+        base_model_name,
+        cache_dir=cache_dir,
+        token=token,
+        trust_remote_code=trust_remote_code,
+    )
+    config.vocab_size = tokenizer.vocab_size
+    config.pad_token_id = tokenizer.pad_token_id
+    config.bos_token_id = tokenizer.bos_token_id
+    config.eos_token_id = tokenizer.eos_token_id
+    
+    # Set conv_bias to False to match ESPnet training
+    config.conv_bias = False  # Uncomment if you want to match ESPnet exactly
+
+    model = Wav2Vec2ForCTC.from_pretrained(
+        base_model_name,
+        config=config,
+        cache_dir=cache_dir,
+        token=token,
+        trust_remote_code=trust_remote_code,
+        ignore_mismatched_sizes=True,
+    )
+    return config, model
+
+
+def _load_partial_espnet_weights_into_hf(model: Wav2Vec2ForCTC, checkpoint_dir: str) -> Dict[str, Any]:
+    """Attempt to load ESPnet .pth weights into a HF Wav2Vec2 model with best-effort key matching.
+
+    Returns a stats dict with counts of loaded and total parameters.
+    """
+    ckpt_dir = Path(checkpoint_dir)
+    pth_files = sorted(ckpt_dir.glob("*.pth"))
+    if not pth_files:
+        logger.warning(f"No .pth found under {checkpoint_dir}")
+        return {"loaded_keys": 0, "total_hf_keys": 0}
+
+    # Heuristic: prefer '5epoch.pth' if present
+    pth_path = next((p for p in pth_files if p.name.startswith("5epoch")), pth_files[-1])
+    logger.info(f"Loading ESPnet checkpoint: {pth_path}")
+    ckpt = torch.load(pth_path, map_location="cpu")
+
+    # Try common containers
+    if isinstance(ckpt, dict):
+        if "model" in ckpt and isinstance(ckpt["model"], dict):
+            src_sd = ckpt["model"]
+        elif "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
+            src_sd = ckpt["state_dict"]
+        else:
+            # Maybe it's already a raw state dict
+            src_sd = ckpt
+    else:
+        logger.warning("Unexpected checkpoint format; skip weight loading")
+        return {"loaded_keys": 0, "total_hf_keys": 0}
+
+    hf_sd = model.state_dict()
+    new_sd = {}
+    
+    # Create mapping between ESPnet and HF keys
+    def map_espnet_to_hf_key(espnet_key: str) -> Optional[str]:
+        """Map ESPnet key to HuggingFace key format."""
+        
+        # Start with the original key
+        hf_key = espnet_key
+        
+        # Step 1: Handle the main prefix transformations
+        if hf_key.startswith("encoder.hubert_pretrain_model.wav2vec2."):
+            hf_key = hf_key.replace("encoder.hubert_pretrain_model.wav2vec2.", "wav2vec2.")
+        elif hf_key.startswith("encoder.hubert_pretrain_model."):
+            hf_key = hf_key.replace("encoder.hubert_pretrain_model.", "wav2vec2.")
+        elif hf_key.startswith("encoder.wav2vec2."):
+            hf_key = hf_key.replace("encoder.wav2vec2.", "wav2vec2.")
+        elif hf_key.startswith("encoder."):
+            # Be careful with this one - only if it's not already handled
+            if not hf_key.startswith("wav2vec2."):
+                hf_key = hf_key.replace("encoder.", "wav2vec2.", 1)
+        
+        # Step 2: Handle encoder.transformer -> encoder renaming
+        hf_key = hf_key.replace(".encoder.transformer.", ".encoder.")
+        hf_key = hf_key.replace("wav2vec2.encoder.transformer.", "wav2vec2.encoder.")
+        
+        # Step 3: Handle specific component renaming
+        # Feed forward layer renaming
+        hf_key = hf_key.replace(".feed_forward.w_1.", ".feed_forward.intermediate_dense.")
+        hf_key = hf_key.replace(".feed_forward.w_2.", ".feed_forward.output_dense.")
+        
+        # Layer norm renaming
+        hf_key = hf_key.replace(".feed_forward_macaron.w_1.", ".feed_forward.intermediate_dense.")
+        hf_key = hf_key.replace(".feed_forward_macaron.w_2.", ".feed_forward.output_dense.")
+        hf_key = hf_key.replace(".norm1.", ".layer_norm.")
+        hf_key = hf_key.replace(".norm2.", ".final_layer_norm.")
+        hf_key = hf_key.replace(".self_attn_layer_norm.", ".layer_norm.")
+        hf_key = hf_key.replace(".final_layer_norm.", ".final_layer_norm.")
+        
+        # Attention component renaming  
+        hf_key = hf_key.replace(".self_attn.", ".attention.")
+        
+        # Positional convolution renaming
+        if "pos_conv_embed.conv.weight_g" in hf_key:
+            hf_key = hf_key.replace("pos_conv_embed.conv.weight_g", "pos_conv_embed.conv.parametrizations.weight.original0")
+        elif "pos_conv_embed.conv.weight_v" in hf_key:
+            hf_key = hf_key.replace("pos_conv_embed.conv.weight_v", "pos_conv_embed.conv.parametrizations.weight.original1")
+        
+        # Feature projection renaming
+        hf_key = hf_key.replace("encoder.feature_projection.", "feature_projection.")
+        
+        # Masked spec embed renaming
+        if hf_key == "wav2vec2.mask_emb":
+            hf_key = "wav2vec2.masked_spec_embed"
+        
+        return hf_key if hf_key != espnet_key else None
+
+    loaded = 0
+    matched_keys = []
+    
+    # First try direct mapping from ESPnet to HF
+    for espnet_key, espnet_val in src_sd.items():
+        # Skip non-tensor values
+        if not isinstance(espnet_val, torch.Tensor):
+            continue
+            
+        # Try to map ESPnet key to HF key
+        hf_key = map_espnet_to_hf_key(espnet_key)
+        
+        if hf_key and hf_key in hf_sd:
+            if hf_sd[hf_key].shape == espnet_val.shape:
+                new_sd[hf_key] = espnet_val
+                loaded += 1
+                matched_keys.append(hf_key)
+                logger.debug(f"Matched: {espnet_key} -> {hf_key}")
+    
+    # Second pass: try to match remaining HF keys
+    for hf_key, hf_val in hf_sd.items():
+        if hf_key.startswith("lm_head."):
+            continue  # skip CTC head; different vocab
+        if hf_key in matched_keys:
+            continue  # already matched
+            
+        # Generate possible ESPnet key candidates
+        candidates = []
+        
+        # Basic patterns
+        if hf_key.startswith("wav2vec2."):
+            base_key = hf_key[len("wav2vec2."):]
+            candidates.extend([
+                f"encoder.hubert_pretrain_model.wav2vec2.{base_key}",
+                f"encoder.hubert_pretrain_model.{base_key}",
+                f"encoder.wav2vec2.{base_key}",
+                f"encoder.{base_key}",
+                f"model.{base_key}",
+            ])
+        
+        # Try each candidate
+        for cand in candidates:
+            if cand in src_sd and src_sd[cand].shape == hf_val.shape:
+                new_sd[hf_key] = src_sd[cand]
+                loaded += 1
+                matched_keys.append(hf_key)
+                logger.debug(f"Matched (2nd pass): {cand} -> {hf_key}")
+                break
+
+    missing = [k for k in hf_sd.keys() if k not in new_sd and not k.startswith("lm_head.")]
+    logger.info(
+        f"ESPnet->HF weight load: matched {loaded} / {len(hf_sd)} HF tensors; "
+        f"unmatched (first 10): {missing[:10]}"
+    )
+    
+    # Log all missing keys for debugging
+    if missing:
+        logger.info("All unmatched HF keys (excluding lm_head):")
+        for key in missing:
+            logger.info(f"  - {key}")
+
+    model.load_state_dict({**hf_sd, **new_sd}, strict=False)
+    return {"loaded_keys": loaded, "total_hf_keys": len(hf_sd), "matched_keys": matched_keys}
 
 
 class CustomProcessor(ProcessorMixin):
@@ -115,15 +317,75 @@ class FreezeEncoderCallback(TrainerCallback):
     def on_step_end(self, args, state, control, **kwargs):
         if self.encoder_frozen and state.global_step >= self.freeze_encoder_steps:
             # Unfreeze encoder after warmup steps
-            for param in self.model.wavlm.feature_extractor.parameters():
+            for param in self.model.wav2vec2.feature_extractor.parameters():
                 param.requires_grad = True
-            for param in self.model.wavlm.feature_projection.parameters():
+            for param in self.model.wav2vec2.feature_projection.parameters():
                 param.requires_grad = True
-            for param in self.model.wavlm.encoder.parameters():
+            for param in self.model.wav2vec2.encoder.parameters():
                 param.requires_grad = True
             self.encoder_frozen = False
             print(f"\nUnfreezing encoder at step {state.global_step}")
         return control
+
+
+class CTCTrainer(Trainer):
+    """
+    Custom trainer that logs predictions during evaluation.
+    """
+    
+    def __init__(self, *args, num_examples_to_log=5, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.num_examples_to_log = num_examples_to_log
+        self.eval_predictions = None
+        self.eval_labels = None
+    
+    def compute_metrics(self, eval_pred):
+        """Override to store predictions for logging."""
+        if self.args.predict_with_generate:
+            # Handle generation case if needed
+            return super().compute_metrics(eval_pred)
+        
+        # Call the original compute_metrics
+        metrics = self.compute_metrics_fn(eval_pred) if self.compute_metrics_fn is not None else {}
+        
+        # Extract and log predictions
+        if "pred_str" in metrics and "label_str" in metrics:
+            self.eval_predictions = metrics.pop("pred_str")
+            self.eval_labels = metrics.pop("label_str")
+            
+            # Log sample predictions
+            if is_main_process(self.args.local_rank):
+                logger.info("\n" + "="*80)
+                logger.info("Sample Predictions from Evaluation:")
+                logger.info("="*80)
+                
+                num_to_show = min(self.num_examples_to_log, len(self.eval_predictions))
+                for i in range(num_to_show):
+                    logger.info(f"\nExample {i+1}:")
+                    logger.info(f"  Label: {self.eval_labels[i] if i < len(self.eval_labels) else 'N/A'}")
+                    logger.info(f"  Pred:  {self.eval_predictions[i] if i < len(self.eval_predictions) else 'N/A'}")
+                
+                logger.info("="*80 + "\n")
+                
+                # Log to wandb if available
+                if wandb.run is not None:
+                    # Create a table for wandb
+                    table_data = []
+                    for i in range(num_to_show):
+                        table_data.append([
+                            i+1,
+                            self.eval_labels[i] if i < len(self.eval_labels) else 'N/A',
+                            self.eval_predictions[i] if i < len(self.eval_predictions) else 'N/A'
+                        ])
+                    
+                    wandb.log({
+                        "eval/predictions_table": wandb.Table(
+                            columns=["Example", "Label", "Prediction"],
+                            data=table_data
+                        )
+                    })
+        
+        return metrics
 
 
 @dataclass
@@ -133,7 +395,7 @@ class ModelArguments:
     """
 
     model_name_or_path: str = field(
-        default="microsoft/wavlm-large",
+        default="facebook/wav2vec2-large-xlsr-53",
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
     )
     tokenizer_vocab_file: str = field(
@@ -314,6 +576,10 @@ class DataTrainingArguments:
         default="wavlm-cgn",
         metadata={"help": "Weights & Biases run name. If not specified, will be auto-generated."}
     )
+    num_examples_to_log: int = field(
+        default=5,
+        metadata={"help": "Number of prediction examples to log during evaluation."}
+    )
 
 
 @dataclass
@@ -455,23 +721,48 @@ def main():
     raw_datasets = DatasetDict()
     
     if training_args.do_train:
-        raw_datasets["train"] = load_cgn_data(data_args.cgn_data_dir, data_args.train_split_name).select(range(100))
+        raw_datasets["train"] = load_cgn_data(data_args.cgn_data_dir, data_args.train_split_name)
         
     if training_args.do_eval:
-        raw_datasets["eval"] = load_cgn_data(data_args.cgn_data_dir, data_args.eval_split_name).select(range(100)) 
+        raw_datasets["eval"] = load_cgn_data(data_args.cgn_data_dir, data_args.eval_split_name)
         
     if training_args.do_predict:
-        raw_datasets["test"] = load_cgn_data(data_args.cgn_data_dir, data_args.test_split_name).select(range(100))
+        raw_datasets["test"] = load_cgn_data(data_args.cgn_data_dir, data_args.test_split_name)
 
     # Initialize custom tokenizer
-    tokenizer = BPECTCTokenizer(
-        vocab_file=model_args.tokenizer_vocab_file,
-        merges_file=model_args.tokenizer_merges_file,
-    )
+    # Check if we're loading from a HF model that already has tokenizer files
+    if not _is_espnet_ssl_checkpoint_dir(model_args.model_name_or_path):
+        # Try to load tokenizer from model path first
+        hf_vocab_path = os.path.join(model_args.model_name_or_path, "vocab.json")
+        hf_merges_path = os.path.join(model_args.model_name_or_path, "merges.txt")
+        
+        if os.path.exists(hf_vocab_path) and os.path.exists(hf_merges_path):
+            # Use tokenizer from HF model directory
+            tokenizer = BPECTCTokenizer(
+                vocab_file=hf_vocab_path,
+                merges_file=hf_merges_path,
+            )
+        else:
+            # Fall back to provided paths
+            tokenizer = BPECTCTokenizer(
+                vocab_file=model_args.tokenizer_vocab_file,
+                merges_file=model_args.tokenizer_merges_file,
+            )
+    else:
+        # Use provided paths for ESPnet checkpoint
+        tokenizer = BPECTCTokenizer(
+            vocab_file=model_args.tokenizer_vocab_file,
+            merges_file=model_args.tokenizer_merges_file,
+        )
 
-    # Load feature extractor (using Wav2Vec2FeatureExtractor for WavLM)
+    # Load feature extractor (using Wav2Vec2FeatureExtractor)
+    # If an ESPnet checkpoint dir is provided, load FE from a compatible HF base.
+    fe_source = (
+        "facebook/wav2vec2-large-xlsr-53" if _is_espnet_ssl_checkpoint_dir(model_args.model_name_or_path)
+        else model_args.model_name_or_path
+    )
     feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
-        model_args.model_name_or_path,
+        fe_source,
         cache_dir=model_args.cache_dir,
         token=data_args.token,
         trust_remote_code=data_args.trust_remote_code,
@@ -480,47 +771,46 @@ def main():
     # Create custom processor with both feature extractor and tokenizer
     processor = CustomProcessor(feature_extractor=feature_extractor, tokenizer=tokenizer)
 
-    # Load model config
-    config = WavLMConfig.from_pretrained(
-        model_args.model_name_or_path,
-        cache_dir=model_args.cache_dir,
-        token=data_args.token,
-        trust_remote_code=data_args.trust_remote_code,
-    )
+    # Build model/config
+    if _is_espnet_ssl_checkpoint_dir(model_args.model_name_or_path):
+        logger.info(f"Detected ESPnet SSL checkpoint dir: {model_args.model_name_or_path}")
+        # Initialize from a HF base (e.g., facebook/wav2vec2-large-xlsr-53), then load partial weights
+        base_name = "facebook/wav2vec2-large-xlsr-53"
+        config, model = _init_wav2vec2_base_model(
+            tokenizer,
+            base_model_name=base_name,
+            cache_dir=model_args.cache_dir,
+            token=data_args.token,
+            trust_remote_code=data_args.trust_remote_code,
+        )
+        stats = _load_partial_espnet_weights_into_hf(model, model_args.model_name_or_path)
+        logger.info(f"Loaded ESPnet weights: {stats}")
+    else:
+        # Standard HF init
+        config = Wav2Vec2Config.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            token=data_args.token,
+            trust_remote_code=data_args.trust_remote_code,
+        )
+        config.vocab_size = tokenizer.vocab_size
+        config.pad_token_id = tokenizer.pad_token_id
+        config.bos_token_id = tokenizer.bos_token_id
+        config.eos_token_id = tokenizer.eos_token_id
 
-    # Update config with tokenizer-related settings
-    config.vocab_size = tokenizer.vocab_size
-    config.pad_token_id = tokenizer.pad_token_id
-    config.bos_token_id = tokenizer.bos_token_id
-    config.eos_token_id = tokenizer.eos_token_id
-    
-    # # Update config with model-specific settings
-    # config.attention_dropout = model_args.attention_dropout
-    # config.activation_dropout = model_args.activation_dropout
-    # config.feat_proj_dropout = model_args.feat_proj_dropout
-    # config.hidden_dropout = model_args.hidden_dropout
-    # config.final_dropout = model_args.final_dropout
-    # config.mask_time_prob = model_args.mask_time_prob
-    # config.mask_time_length = model_args.mask_time_length
-    # config.mask_feature_prob = model_args.mask_feature_prob
-    # config.mask_feature_length = model_args.mask_feature_length
-    # config.layerdrop = model_args.layerdrop
-    # config.ctc_loss_reduction = model_args.ctc_loss_reduction
-    # config.ctc_zero_infinity = model_args.ctc_zero_infinity
-
-    # Load model
-    model = WavLMForCTC.from_pretrained(
-        model_args.model_name_or_path,
-        config=config,
-        cache_dir=model_args.cache_dir,
-        token=data_args.token,
-        trust_remote_code=data_args.trust_remote_code,
-        ignore_mismatched_sizes=True,  # Important: Allow resizing of output layer
-    )
-
+        model = Wav2Vec2ForCTC.from_pretrained(
+            model_args.model_name_or_path,
+            config=config,
+            cache_dir=model_args.cache_dir,
+            token=data_args.token,
+            trust_remote_code=data_args.trust_remote_code,
+            ignore_mismatched_sizes=True,  # Important: Allow resizing of output layer
+        )
     # Freeze feature encoder if requested
     if model_args.freeze_feature_encoder:
         model.freeze_feature_encoder()
+    # Make CTCLoss robust against invalid alignment (avoid inf -> NaN)
+    model.config.ctc_zero_infinity = True
 
     # Preprocessing the datasets
     def prepare_dataset(batch):
@@ -538,10 +828,10 @@ def main():
             return_tensors="np"
         )
         batch["input_values"] = inputs.input_values[0]
-        batch["input_length"] = len(inputs.input_values[0])
+        batch["input_length"] = len(inputs.input_values[0])  # raw samples length
         
         # Encode labels using custom tokenizer
-        batch["labels"] = tokenizer.encode(batch["transcription"])
+        batch["labels"] = tokenizer.encode(batch["transcription"])      
         
         return batch
 
@@ -601,15 +891,16 @@ def main():
 
         wer = wer_metric.compute(predictions=pred_str, references=label_str)
 
-        return {"wer": wer}
+        # Return metrics - note that pred_str and label_str will be logged by callback
+        return {"wer": wer, "pred_str": pred_str, "label_str": label_str}
 
     # Set up callbacks
     callbacks = []
     if model_args.freeze_encoder_steps > 0:
         callbacks.append(FreezeEncoderCallback(model_args.freeze_encoder_steps, model))
 
-    # Initialize our Trainer
-    trainer = Trainer(
+    # Initialize our custom Trainer with prediction logging
+    trainer = CTCTrainer(
         model=model,
         data_collator=data_collator,
         args=training_args,
@@ -618,6 +909,7 @@ def main():
         eval_dataset=vectorized_datasets["eval"] if training_args.do_eval else None,
         tokenizer=feature_extractor,
         callbacks=callbacks,
+        num_examples_to_log=data_args.num_examples_to_log,
     )
 
     # Training
@@ -669,9 +961,9 @@ def main():
         with open(config_file, "w") as f:
             json.dump(config.to_dict(), f, indent=2)
 
-    # Save tokenizer vocabulary
+    # Save tokenizer 
     if training_args.output_dir is not None:
-        tokenizer.save_vocabulary(training_args.output_dir)
+        tokenizer.save_pretrained(training_args.output_dir)
 
     return results
 

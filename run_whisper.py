@@ -33,11 +33,13 @@ from transformers import (
     TrainerCallback,
     ProcessorMixin,
     PretrainedConfig,
+    GenerationConfig,
 )
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 import wandb
+from transformers.generation.utils import GenerationMixin
 
 # Import custom tokenizer
 from utils.tokenizer.bpe_aed_tokenizer import BPEAEDTokenizer
@@ -122,6 +124,62 @@ class FreezeEncoderCallback(TrainerCallback):
             self.encoder_frozen = False
             print(f"\nUnfreezing encoder at step {state.global_step}")
         return control
+
+
+class WhisperSeq2SeqTrainer(Seq2SeqTrainer):
+    """
+    Custom Seq2Seq trainer that logs predictions during evaluation.
+    """
+    
+    def __init__(self, *args, num_examples_to_log=5, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.num_examples_to_log = num_examples_to_log
+        self.eval_predictions = None
+        self.eval_labels = None
+    
+    def compute_metrics(self, eval_pred):
+        """Override to store predictions for logging."""
+        # Call the original compute_metrics
+        metrics = self.compute_metrics_fn(eval_pred) if self.compute_metrics_fn is not None else {}
+        
+        # Extract and log predictions
+        if "pred_str" in metrics and "label_str" in metrics:
+            self.eval_predictions = metrics.pop("pred_str")
+            self.eval_labels = metrics.pop("label_str")
+            
+            # Log sample predictions
+            if is_main_process(self.args.local_rank):
+                logger.info("\n" + "="*80)
+                logger.info("Sample Predictions from Evaluation:")
+                logger.info("="*80)
+                
+                num_to_show = min(self.num_examples_to_log, len(self.eval_predictions))
+                for i in range(num_to_show):
+                    logger.info(f"\nExample {i+1}:")
+                    logger.info(f"  Label: {self.eval_labels[i] if i < len(self.eval_labels) else 'N/A'}")
+                    logger.info(f"  Pred:  {self.eval_predictions[i] if i < len(self.eval_predictions) else 'N/A'}")
+                
+                logger.info("="*80 + "\n")
+                
+                # Log to wandb if available
+                if wandb.run is not None:
+                    # Create a table for wandb
+                    table_data = []
+                    for i in range(num_to_show):
+                        table_data.append([
+                            i+1,
+                            self.eval_labels[i] if i < len(self.eval_labels) else 'N/A',
+                            self.eval_predictions[i] if i < len(self.eval_predictions) else 'N/A'
+                        ])
+                    
+                    wandb.log({
+                        "eval/predictions_table": wandb.Table(
+                            columns=["Example", "Label", "Prediction"],
+                            data=table_data
+                        )
+                    })
+        
+        return metrics
 
 
 @dataclass
@@ -277,7 +335,7 @@ class DataTrainingArguments:
         metadata={"help": "The name of the dataset column containing the text data. Defaults to 'text'"},
     )
     max_duration_in_seconds: float = field(
-        default=20.0,
+        default=30.0,
         metadata={
             "help": (
                 "Truncate audio files that are longer than `max_duration_in_seconds` seconds to"
@@ -335,6 +393,10 @@ class DataTrainingArguments:
     wandb_run_name: Optional[str] = field(
         default="whisper-cgn",
         metadata={"help": "Weights & Biases run name. If not specified, will be auto-generated."}
+    )
+    num_examples_to_log: int = field(
+        default=5,
+        metadata={"help": "Number of prediction examples to log during evaluation."}
     )
 
 
@@ -409,6 +471,27 @@ def load_cgn_data(data_dir: str, split: str) -> Dataset:
     dataset = Dataset.from_pandas(full_df)
     
     return dataset
+
+
+def patch_whisper_generation_to_basic(model: WhisperForConditionalGeneration) -> WhisperForConditionalGeneration:
+    """Override Whisper's custom generation with the base GenerationMixin implementation.
+    Disables Whisper-specific forced/suppressed tokens so decoding becomes a plain beam search
+    starting from decoder_start_token_id using input_features only.
+    """
+    # Disable Whisper-specific constraints on both config and generation_config
+    if hasattr(model, "generation_config") and model.generation_config is not None:
+        model.generation_config.forced_decoder_ids = None
+        model.generation_config.suppress_tokens = None
+        if getattr(model.generation_config, "decoder_start_token_id", None) is None:
+            model.generation_config.decoder_start_token_id = model.config.decoder_start_token_id
+    model.config.forced_decoder_ids = None
+    model.config.suppress_tokens = None
+
+    # Bind base GenerationMixin methods to bypass Whisper's overridden generate/logits-processor
+    model.generate = GenerationMixin.generate.__get__(model, model.__class__)
+    model._get_logits_processor = GenerationMixin._get_logits_processor.__get__(model, model.__class__)
+
+    return model
 
 
 def main():
@@ -559,7 +642,21 @@ def main():
             param.requires_grad = False
         model.model.decoder.gradient_checkpointing = False
     
-    # Create custom processor with both feature extractor and tokenizer
+    # Ensure we use basic, task/language-agnostic generation
+    patch_whisper_generation_to_basic(model)
+
+    model.generation_config = GenerationConfig(
+        forced_decoder_ids=None,
+        suppress_tokens=None,
+        decoder_start_token_id=model.config.decoder_start_token_id,
+        num_beams=training_args.generation_num_beams,
+        max_length=training_args.generation_max_length,
+        early_stopping=True,
+        length_penalty=1.0,
+        repetition_penalty=1.0,
+        no_repeat_ngram_size=3,
+    )
+        # Create custom processor with both feature extractor and tokenizer
     processor = CustomProcessor(feature_extractor=feature_extractor, tokenizer=tokenizer)
     
     # 6. Preprocessing the datasets
@@ -577,8 +674,9 @@ def main():
             sampling_rate=sampling_rate,
             return_tensors="np"
         )
+
         batch["input_features"] = inputs.input_features[0]
-        batch["input_length"] = len(inputs.input_features[0])
+        batch["input_length"] = len(audio_array)
         
         # Encode labels using custom tokenizer with special tokens
         transcription = batch[data_args.text_column_name]
@@ -598,9 +696,12 @@ def main():
             desc="preprocess datasets",
         )
     
-    # Filter training data with labels that are too long
-    def is_audio_in_length_range(input_length):
-        return input_length < data_args.max_duration_in_seconds
+    # Filter dataset by duration
+    def is_audio_in_length_range(length):
+        return (
+            length > data_args.min_duration_in_seconds * feature_extractor.sampling_rate
+            and length < data_args.max_duration_in_seconds * feature_extractor.sampling_rate
+        )
     
     if training_args.do_train:
         vectorized_datasets["train"] = vectorized_datasets["train"].filter(
@@ -621,7 +722,7 @@ def main():
     if training_args.do_predict and data_args.max_test_samples is not None:
         max_test_samples = min(len(vectorized_datasets["test"]), data_args.max_test_samples)
         vectorized_datasets["test"] = vectorized_datasets["test"].select(range(max_test_samples))
-    
+
     # 7. Define data collator
     forward_attention_mask = (
         getattr(config, "model_type", None) == "whisper"
@@ -633,7 +734,6 @@ def main():
         decoder_start_token_id=model.config.decoder_start_token_id,
         forward_attention_mask=forward_attention_mask,
     )
-    
     # 8. Metrics
     metric = evaluate.load("wer")
     
@@ -650,7 +750,8 @@ def main():
         
         wer = metric.compute(predictions=pred_str, references=label_str)
         
-        return {"wer": wer}
+        # Return metrics - note that pred_str and label_str will be logged by callback
+        return {"wer": wer, "pred_str": pred_str, "label_str": label_str}
     
     # 9. Initialize our trainer
     # Set up callbacks
@@ -658,7 +759,8 @@ def main():
     if model_args.freeze_encoder_steps > 0:
         callbacks.append(FreezeEncoderCallback(model_args.freeze_encoder_steps, model))
     
-    trainer = Seq2SeqTrainer(
+    # Initialize our custom Seq2SeqTrainer with prediction logging
+    trainer = WhisperSeq2SeqTrainer(
         model=model,
         args=training_args,
         train_dataset=vectorized_datasets["train"] if training_args.do_train else None,
@@ -667,6 +769,7 @@ def main():
         data_collator=data_collator,
         compute_metrics=compute_metrics if training_args.predict_with_generate else None,
         callbacks=callbacks,
+        num_examples_to_log=data_args.num_examples_to_log,
     )
     
     # 10. Training

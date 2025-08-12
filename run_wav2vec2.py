@@ -126,6 +126,66 @@ class FreezeEncoderCallback(TrainerCallback):
         return control
 
 
+class CTCTrainer(Trainer):
+    """
+    Custom trainer that logs predictions during evaluation.
+    """
+    
+    def __init__(self, *args, num_examples_to_log=5, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.num_examples_to_log = num_examples_to_log
+        self.eval_predictions = None
+        self.eval_labels = None
+    
+    def compute_metrics(self, eval_pred):
+        """Override to store predictions for logging."""
+        if self.args.predict_with_generate:
+            # Handle generation case if needed
+            return super().compute_metrics(eval_pred)
+        
+        # Call the original compute_metrics
+        metrics = self.compute_metrics_fn(eval_pred) if self.compute_metrics_fn is not None else {}
+        
+        # Extract and log predictions
+        if "pred_str" in metrics and "label_str" in metrics:
+            self.eval_predictions = metrics.pop("pred_str")
+            self.eval_labels = metrics.pop("label_str")
+            
+            # Log sample predictions
+            if is_main_process(self.args.local_rank):
+                logger.info("\n" + "="*80)
+                logger.info("Sample Predictions from Evaluation:")
+                logger.info("="*80)
+                
+                num_to_show = min(self.num_examples_to_log, len(self.eval_predictions))
+                for i in range(num_to_show):
+                    logger.info(f"\nExample {i+1}:")
+                    logger.info(f"  Label: {self.eval_labels[i] if i < len(self.eval_labels) else 'N/A'}")
+                    logger.info(f"  Pred:  {self.eval_predictions[i] if i < len(self.eval_predictions) else 'N/A'}")
+                
+                logger.info("="*80 + "\n")
+                
+                # Log to wandb if available
+                if wandb.run is not None:
+                    # Create a table for wandb
+                    table_data = []
+                    for i in range(num_to_show):
+                        table_data.append([
+                            i+1,
+                            self.eval_labels[i] if i < len(self.eval_labels) else 'N/A',
+                            self.eval_predictions[i] if i < len(self.eval_predictions) else 'N/A'
+                        ])
+                    
+                    wandb.log({
+                        "eval/predictions_table": wandb.Table(
+                            columns=["Example", "Label", "Prediction"],
+                            data=table_data
+                        )
+                    })
+        
+        return metrics
+
+
 @dataclass
 class ModelArguments:
     """
@@ -314,6 +374,10 @@ class DataTrainingArguments:
         default="wav2vec2-cgn",
         metadata={"help": "Weights & Biases run name. If not specified, will be auto-generated."}
     )
+    num_examples_to_log: int = field(
+        default=5,
+        metadata={"help": "Number of prediction examples to log during evaluation."}
+    )
 
 
 @dataclass
@@ -455,13 +519,13 @@ def main():
     raw_datasets = DatasetDict()
     
     if training_args.do_train:
-        raw_datasets["train"] = load_cgn_data(data_args.cgn_data_dir, data_args.train_split_name).select(range(100))
+        raw_datasets["train"] = load_cgn_data(data_args.cgn_data_dir, data_args.train_split_name)
         
     if training_args.do_eval:
-        raw_datasets["eval"] = load_cgn_data(data_args.cgn_data_dir, data_args.eval_split_name).select(range(100)) 
+        raw_datasets["eval"] = load_cgn_data(data_args.cgn_data_dir, data_args.eval_split_name)
         
     if training_args.do_predict:
-        raw_datasets["test"] = load_cgn_data(data_args.cgn_data_dir, data_args.test_split_name).select(range(100))
+        raw_datasets["test"] = load_cgn_data(data_args.cgn_data_dir, data_args.test_split_name)
 
     # Initialize custom tokenizer
     tokenizer = BPECTCTokenizer(
@@ -601,15 +665,16 @@ def main():
 
         wer = wer_metric.compute(predictions=pred_str, references=label_str)
 
-        return {"wer": wer}
+        # Return metrics - note that pred_str and label_str will be logged by callback
+        return {"wer": wer, "pred_str": pred_str, "label_str": label_str}
 
     # Set up callbacks
     callbacks = []
     if model_args.freeze_encoder_steps > 0:
         callbacks.append(FreezeEncoderCallback(model_args.freeze_encoder_steps, model))
     
-    # Initialize our Trainer
-    trainer = Trainer(
+    # Initialize our custom Trainer with prediction logging
+    trainer = CTCTrainer(
         model=model,
         data_collator=data_collator,
         args=training_args,
@@ -618,6 +683,7 @@ def main():
         eval_dataset=vectorized_datasets["eval"] if training_args.do_eval else None,
         tokenizer=feature_extractor,
         callbacks=callbacks,
+        num_examples_to_log=data_args.num_examples_to_log,
     )
 
     # Training

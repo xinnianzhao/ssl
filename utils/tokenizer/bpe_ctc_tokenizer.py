@@ -255,23 +255,28 @@ class BPECTCTokenizer(PreTrainedTokenizer):
     
     def save_vocabulary(self, save_directory: str, filename_prefix: Optional[str] = None) -> Tuple[str]:
         """
-        Save the vocabulary to a file.
+        Save the vocabulary and merges files.
         
         Args:
             save_directory: Directory to save the vocabulary file.
             filename_prefix: Optional prefix for the filename.
             
         Returns:
-            Tuple containing the path to the saved vocabulary file.
+            Tuple containing paths to the saved vocabulary and merges files.
         """
+        import shutil
+        
         if not os.path.isdir(save_directory):
             os.makedirs(save_directory, exist_ok=True)
         
         vocab_filename = "vocab.json"
+        merges_filename = "merges.txt"
         if filename_prefix:
             vocab_filename = f"{filename_prefix}-{vocab_filename}"
+            merges_filename = f"{filename_prefix}-{merges_filename}"
         
         vocab_file = os.path.join(save_directory, vocab_filename)
+        merges_file = os.path.join(save_directory, merges_filename)
         
         # Save the vocabulary (without special tokens at the beginning for compatibility)
         # Create original vocab format
@@ -283,6 +288,11 @@ class BPECTCTokenizer(PreTrainedTokenizer):
         
         with open(vocab_file, "w", encoding="utf-8") as f:
             json.dump(original_vocab, f, ensure_ascii=False, indent=2)
+        
+        # Save merges file if it exists
+        if self.merges_file and os.path.exists(self.merges_file):
+            shutil.copy(self.merges_file, merges_file)
+            return (vocab_file, merges_file)
         
         return (vocab_file,)
     
