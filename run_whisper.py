@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Union, Any
 import datasets
 import evaluate
 import torch
+import torch.optim
 import pandas as pd
 import numpy as np
 from datasets import Dataset, DatasetDict
@@ -34,7 +35,10 @@ from transformers import (
     ProcessorMixin,
     PretrainedConfig,
     GenerationConfig,
+    get_linear_schedule_with_warmup,
+    get_cosine_schedule_with_warmup,
 )
+from torch.optim import AdamW
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
@@ -100,42 +104,200 @@ class CustomProcessor(ProcessorMixin):
         preprocessor_config.save_pretrained(save_directory)
 
 
+def get_whisper_parameter_groups(
+    model,
+    encoder_base_lr=3e-5,      # Encoder 顶层 LR
+    decoder_base_lr=1e-4,      # Decoder 顶层 LR  
+    lm_head_lr=3e-4,           # LM head LR
+    layer_decay=0.95,          # LLRD 衰减
+    weight_decay=0.01,
+):
+    """
+    返回 Whisper 模型的分层学习率参数组。
+    
+    Whisper 结构：
+    - model.encoder.layers[*]  # Encoder 层
+    - model.decoder.layers[*]  # Decoder 层  
+    - proj_out (lm_head)       # 输出投影层
+    """
+    no_decay_keywords = ["bias", "LayerNorm.weight", "layer_norm.weight", "layer_norm.bias"]
+    def is_no_decay(n):
+        return any(k in n for k in no_decay_keywords)
+
+    groups = []
+    grouped_ids = set()
+
+    # 1) LM head (输出层)
+    decay, no_decay = [], []
+    for n, p in model.proj_out.named_parameters():
+        if not p.requires_grad:
+            continue
+        (no_decay if is_no_decay(n) else decay).append(p)
+    if decay:
+        groups.append({"params": decay, "lr": lm_head_lr, "weight_decay": weight_decay, "name": "lm_head.decay"})
+    if no_decay:
+        groups.append({"params": no_decay, "lr": lm_head_lr, "weight_decay": 0.0, "name": "lm_head.no_decay"})
+    grouped_ids |= {id(p) for p in decay + no_decay}
+
+    # 2) Decoder 层 LLRD
+    num_decoder_layers = len(model.model.decoder.layers)
+    for layer_idx, layer in enumerate(model.model.decoder.layers):
+        # 顶层是最后一层
+        layer_lr = decoder_base_lr * (layer_decay ** (num_decoder_layers - 1 - layer_idx))
+        decay, no_decay = [], []
+        for n, p in layer.named_parameters():
+            if not p.requires_grad:
+                continue
+            (no_decay if is_no_decay(n) else decay).append(p)
+        if decay:
+            groups.append({"params": decay, "lr": layer_lr, "weight_decay": weight_decay,
+                           "name": f"decoder.layer{layer_idx}.decay"})
+        if no_decay:
+            groups.append({"params": no_decay, "lr": layer_lr, "weight_decay": 0.0,
+                           "name": f"decoder.layer{layer_idx}.no_decay"})
+        grouped_ids |= {id(p) for p in decay + no_decay}
+
+    # 3) Decoder 其他组件 (embed_tokens, embed_positions, layer_norm)
+    # Note: embed_tokens might be shared with proj_out, so skip if already grouped
+    min_decoder_lr = decoder_base_lr * (layer_decay ** (num_decoder_layers - 1))
+    for comp_name in ["embed_tokens", "embed_positions", "layer_norm"]:
+        if hasattr(model.model.decoder, comp_name):
+            comp = getattr(model.model.decoder, comp_name)
+            if comp is None:
+                continue
+            decay, no_decay = [], []
+            for n, p in comp.named_parameters():
+                if not p.requires_grad or id(p) in grouped_ids:
+                    continue
+                (no_decay if is_no_decay(n) else decay).append(p)
+            if decay:
+                groups.append({"params": decay, "lr": min_decoder_lr, "weight_decay": weight_decay,
+                               "name": f"decoder.{comp_name}.decay"})
+            if no_decay:
+                groups.append({"params": no_decay, "lr": min_decoder_lr, "weight_decay": 0.0,
+                               "name": f"decoder.{comp_name}.no_decay"})
+            grouped_ids |= {id(p) for p in decay + no_decay}
+
+    # 4) Encoder 层 LLRD (只在 Stage B 中使用)
+    num_encoder_layers = len(model.model.encoder.layers)
+    for layer_idx, layer in enumerate(model.model.encoder.layers):
+        layer_lr = encoder_base_lr * (layer_decay ** (num_encoder_layers - 1 - layer_idx))
+        decay, no_decay = [], []
+        for n, p in layer.named_parameters():
+            if not p.requires_grad:
+                continue
+            (no_decay if is_no_decay(n) else decay).append(p)
+        if decay:
+            groups.append({"params": decay, "lr": layer_lr, "weight_decay": weight_decay,
+                           "name": f"encoder.layer{layer_idx}.decay"})
+        if no_decay:
+            groups.append({"params": no_decay, "lr": layer_lr, "weight_decay": 0.0,
+                           "name": f"encoder.layer{layer_idx}.no_decay"})
+        grouped_ids |= {id(p) for p in decay + no_decay}
+
+    # 5) Encoder 其他组件 (embed_positions, conv1, conv2, layer_norm)
+    min_encoder_lr = encoder_base_lr * (layer_decay ** (num_encoder_layers - 1))
+    for comp_name in ["embed_positions", "conv1", "conv2", "layer_norm"]:
+        if hasattr(model.model.encoder, comp_name):
+            comp = getattr(model.model.encoder, comp_name)
+            if comp is None:
+                continue
+            decay, no_decay = [], []
+            for n, p in comp.named_parameters():
+                if not p.requires_grad:
+                    continue
+                (no_decay if is_no_decay(n) else decay).append(p)
+            if decay:
+                groups.append({"params": decay, "lr": min_encoder_lr, "weight_decay": weight_decay,
+                               "name": f"encoder.{comp_name}.decay"})
+            if no_decay:
+                groups.append({"params": no_decay, "lr": min_encoder_lr, "weight_decay": 0.0,
+                               "name": f"encoder.{comp_name}.no_decay"})
+            grouped_ids |= {id(p) for p in decay + no_decay}
+
+    # 6) 兜底：任何遗漏的可训练参数
+    decay, no_decay = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad or id(p) in grouped_ids:
+            continue
+        (no_decay if is_no_decay(n) else decay).append(p)
+    if decay:
+        groups.append({"params": decay, "lr": decoder_base_lr, "weight_decay": weight_decay, "name": "other.decay"})
+    if no_decay:
+        groups.append({"params": no_decay, "lr": decoder_base_lr, "weight_decay": 0.0, "name": "other.no_decay"})
+
+    return groups
+
+
 class FreezeEncoderCallback(TrainerCallback):
     """
     Callback to handle progressive unfreezing of encoder.
-    First warmup the decoder/CTC layer for freeze_encoder_steps, then unfreeze encoder.
+    Stage A: Decoder warmup - freeze encoder, train decoder + lm_head
+    Stage B: Full model finetune - unfreeze encoder  
     """
     
-    def __init__(self, freeze_encoder_steps: int, model):
+    def __init__(self, freeze_encoder_steps: int, model, trainer=None):
         self.freeze_encoder_steps = freeze_encoder_steps
         self.model = model
+        self.trainer = trainer
         self.encoder_frozen = freeze_encoder_steps > 0
+        self.stage_b_start_step = None  # Track when Stage B starts
         
         if self.encoder_frozen:
-            # Initially freeze encoder
-            self.model.freeze_encoder()
+            # Stage A: Decoder warmup - freeze encoder
+            for param in self.model.model.encoder.parameters():
+                param.requires_grad = False
+            # Enable decoder and lm_head
+            for param in self.model.model.decoder.parameters():
+                param.requires_grad = True
+            for param in self.model.proj_out.parameters():
+                param.requires_grad = True
+            logger.info("Stage A: Decoder warmup - freezing encoder, training decoder + lm_head only")
             self.model.model.encoder.gradient_checkpointing = False
     
     def on_step_end(self, args, state, control, **kwargs):
         if self.encoder_frozen and state.global_step >= self.freeze_encoder_steps:
-            # Unfreeze encoder after warmup steps
+            # Stage B: Unfreeze encoder and rebuild optimizer
+            logger.info(f"\nStage B: Unfreezing encoder at step {state.global_step}")
+            
+            # Record when Stage B starts
+            self.stage_b_start_step = state.global_step
+            
+            # Unfreeze encoder
             for param in self.model.model.encoder.parameters():
                 param.requires_grad = True
+            
+            # Rebuild optimizer and scheduler
+            if self.trainer and hasattr(kwargs.get('trainer', None), 'optimizer'):
+                trainer = kwargs['trainer']
+                # Store Stage B start step in trainer for scheduler creation
+                trainer.stage_b_start_step = self.stage_b_start_step
+                # Reset optimizer and scheduler to trigger recreation
+                trainer.optimizer = None
+                trainer.lr_scheduler = None
+                # Create new optimizer with updated parameter groups
+                trainer.create_optimizer()
+                # Create new scheduler for Stage B
+                trainer.create_scheduler(trainer.args.max_steps - self.stage_b_start_step, trainer.optimizer)
+                logger.info("Optimizer and scheduler rebuilt for Stage B")
+            
             self.encoder_frozen = False
-            print(f"\nUnfreezing encoder at step {state.global_step}")
         return control
 
 
 class WhisperSeq2SeqTrainer(Seq2SeqTrainer):
     """
-    Custom Seq2Seq trainer that logs predictions during evaluation.
+    Custom Seq2Seq trainer that logs predictions during evaluation and supports layer-wise learning rate decay.
     """
     
-    def __init__(self, *args, num_examples_to_log=5, **kwargs):
+    def __init__(self, *args, num_examples_to_log=5, use_layerwise_lr_decay=True, freeze_encoder_steps=0, **kwargs):
         super().__init__(*args, **kwargs)
         self.num_examples_to_log = num_examples_to_log
         self.eval_predictions = None
         self.eval_labels = None
+        self.use_layerwise_lr_decay = use_layerwise_lr_decay
+        self.freeze_encoder_steps = freeze_encoder_steps
+        self.stage_b_start_step = None  # Will be set by callback
     
     def compute_metrics(self, eval_pred):
         """Override to store predictions for logging."""
@@ -180,6 +342,107 @@ class WhisperSeq2SeqTrainer(Seq2SeqTrainer):
                     })
         
         return metrics
+    
+    def create_optimizer(self):
+        """
+        Override to create optimizer with layer-wise learning rate decay for Whisper.
+        """
+        if self.optimizer is None:
+            if self.use_layerwise_lr_decay:
+                # Check if encoder is frozen (Stage A: Decoder warmup)
+                encoder_frozen = not any(p.requires_grad for p in self.model.model.encoder.parameters())
+                
+                if encoder_frozen:
+                    # Stage A: Decoder warmup - only decoder + lm_head trainable
+                    logger.info("Creating optimizer for Stage A (Decoder warmup)")
+                    parameter_groups = get_whisper_parameter_groups(
+                        self.model,
+                        encoder_base_lr=3e-5,  # Won't be used since encoder is frozen
+                        decoder_base_lr=3e-4,  # Higher LR for decoder during warmup
+                        lm_head_lr=3e-4,       # Same high LR for lm_head
+                        layer_decay=0.95,
+                        weight_decay=0.01
+                    )
+                else:
+                    # Stage B: Full model fine-tuning with LLRD
+                    logger.info("Creating optimizer for Stage B (full model with LLRD)")
+                    parameter_groups = get_whisper_parameter_groups(
+                        self.model,
+                        encoder_base_lr=3e-5,  # Lower LR for encoder
+                        decoder_base_lr=1e-4,  # Normal LR for decoder
+                        lm_head_lr=3e-4,       # Higher LR for lm_head
+                        layer_decay=0.95,
+                        weight_decay=0.01
+                    )
+                
+                # Log parameter groups
+                logger.info("Parameter groups created:")
+                for group in parameter_groups:
+                    num_params = sum(p.numel() for p in group['params'])
+                    if num_params > 0:  # Only log non-empty groups
+                        logger.info(f"  {group['name']}: {num_params:,} params, lr={group['lr']:.2e}, wd={group['weight_decay']}")
+                
+                # Create AdamW optimizer
+                self.optimizer = AdamW(
+                    parameter_groups,
+                    betas=(0.9, 0.98),
+                    eps=1e-8
+                )
+            else:
+                # Fall back to default optimizer creation
+                return super().create_optimizer()
+        
+        return self.optimizer
+    
+    def create_scheduler(self, num_training_steps: int, optimizer: torch.optim.Optimizer = None):
+        """
+        Override to create appropriate scheduler for each stage with independent warmup.
+        """
+        if self.lr_scheduler is None:
+            if optimizer is None:
+                optimizer = self.optimizer
+            
+            # Check if we're in Stage A or Stage B
+            encoder_frozen = not any(p.requires_grad for p in self.model.model.encoder.parameters())
+            
+            if encoder_frozen:
+                # Stage A: Decoder warmup
+                # Use 10% of Stage A steps for warmup (300 steps for 3000 total)
+                warmup_steps = int(self.freeze_encoder_steps * 0.1)
+                logger.info(f"Creating Stage A scheduler: linear warmup for {warmup_steps} steps, total {self.freeze_encoder_steps} steps")
+                
+                self.lr_scheduler = get_linear_schedule_with_warmup(
+                    optimizer,
+                    num_warmup_steps=warmup_steps,
+                    num_training_steps=self.freeze_encoder_steps
+                )
+            else:
+                # Stage B: Full model training
+                # Calculate remaining steps after Stage A
+                if hasattr(self, 'stage_b_start_step') and self.stage_b_start_step is not None:
+                    stage_b_steps = self.args.max_steps - self.stage_b_start_step
+                else:
+                    # If called directly without Stage A
+                    stage_b_steps = num_training_steps
+                
+                # Use 10% of Stage B steps for warmup
+                warmup_steps = int(stage_b_steps * 0.1)
+                logger.info(f"Creating Stage B scheduler: {'cosine' if self.args.lr_scheduler_type == 'cosine' else 'linear'} warmup for {warmup_steps} steps, total {stage_b_steps} steps")
+                
+                if self.args.lr_scheduler_type == "cosine":
+                    self.lr_scheduler = get_cosine_schedule_with_warmup(
+                        optimizer,
+                        num_warmup_steps=warmup_steps,
+                        num_training_steps=stage_b_steps
+                    )
+                else:
+                    self.lr_scheduler = get_linear_schedule_with_warmup(
+                        optimizer,
+                        num_warmup_steps=warmup_steps,
+                        num_training_steps=stage_b_steps
+                    )
+        
+        return self.lr_scheduler
 
 
 @dataclass
@@ -756,8 +1019,10 @@ def main():
     # 9. Initialize our trainer
     # Set up callbacks
     callbacks = []
+    freeze_callback = None
     if model_args.freeze_encoder_steps > 0:
-        callbacks.append(FreezeEncoderCallback(model_args.freeze_encoder_steps, model))
+        freeze_callback = FreezeEncoderCallback(model_args.freeze_encoder_steps, model)
+        callbacks.append(freeze_callback)
     
     # Initialize our custom Seq2SeqTrainer with prediction logging
     trainer = WhisperSeq2SeqTrainer(
@@ -770,7 +1035,13 @@ def main():
         compute_metrics=compute_metrics if training_args.predict_with_generate else None,
         callbacks=callbacks,
         num_examples_to_log=data_args.num_examples_to_log,
+        use_layerwise_lr_decay=True,  # Enable layer-wise learning rate decay
+        freeze_encoder_steps=model_args.freeze_encoder_steps,  # Pass freeze steps to trainer
     )
+    
+    # Set trainer reference in callback for optimizer rebuilding
+    if freeze_callback:
+        freeze_callback.trainer = trainer
     
     # 10. Training
     if training_args.do_train:

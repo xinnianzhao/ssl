@@ -7,6 +7,9 @@ scripts/
 # Weights & Biases
 wandb/
 
+# Logs
+logs/
+
 # Python
 __pycache__/
 *.py[cod]

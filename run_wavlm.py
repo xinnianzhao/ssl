@@ -36,7 +36,11 @@ from transformers import (
     TrainerCallback,
     ProcessorMixin,
     PretrainedConfig,
+    get_linear_schedule_with_warmup,
+    get_cosine_schedule_with_warmup,
 )
+from torch.optim import AdamW
+import torch
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
@@ -299,45 +303,195 @@ class CustomProcessor(ProcessorMixin):
         preprocessor_config.save_pretrained(save_directory)
 
 
+def get_parameter_groups(
+    model,
+    base_lr=1e-4,          # 顶层 encoder 的 LR
+    layer_decay=0.95,      # LLRD 衰减
+    ctc_lr=3e-4,           # CTC 头 LR
+    weight_decay=0.01,
+    freeze_feature_extractor=True,  # 通常冻结 CNN
+):
+    """
+    返回可直接给 AdamW 的 optimizer_grouped_parameters。
+    规则：
+      - CTC 头单独 lr
+      - encoder.layers.* 做 LLRD（越底层 lr 越小）
+      - encoder.pos_conv_embed & encoder.layer_norm 视为最底层（最小 lr）
+      - feature_projection 给次低 lr
+      - feature_extractor 可冻结或给极低 lr
+      - bias/LayerNorm 参数 weight_decay=0
+      - 仅包含 requires_grad=True 的参数（支持 warmup 阶段只训 CTC）
+    """
+    no_decay_keywords = ["bias", "LayerNorm.weight", "layer_norm.weight", "layer_norm.bias"]
+    def is_no_decay(n):
+        return any(k in n for k in no_decay_keywords)
+
+    if freeze_feature_extractor:
+        for p in model.wav2vec2.feature_extractor.parameters():
+            p.requires_grad = False
+
+    # 统计层数
+    num_layers = len(model.wav2vec2.encoder.layers)
+
+    groups = []  # 会填充多个 {params, lr, weight_decay, name}
+
+    # 1) CTC 头
+    decay, no_decay = [], []
+    for n, p in model.lm_head.named_parameters():
+        if not p.requires_grad: 
+            continue
+        (no_decay if is_no_decay(n) else decay).append(p)
+    if decay:
+        groups.append({"params": decay, "lr": ctc_lr, "weight_decay": weight_decay, "name": "ctc_head.decay"})
+    if no_decay:
+        groups.append({"params": no_decay, "lr": ctc_lr, "weight_decay": 0.0, "name": "ctc_head.no_decay"})
+
+    grouped_ids = set(id(p) for g in groups for p in g["params"])
+
+    # 2) encoder 层做 LLRD
+    for layer_idx, layer in enumerate(model.wav2vec2.encoder.layers):
+        layer_lr = base_lr * (layer_decay ** (num_layers - 1 - layer_idx))
+        decay, no_decay = [], []
+        for n, p in layer.named_parameters():
+            if not p.requires_grad:
+                continue
+            (no_decay if is_no_decay(n) else decay).append(p)
+        if decay:
+            groups.append({"params": decay, "lr": layer_lr, "weight_decay": weight_decay,
+                           "name": f"encoder.layer{layer_idx}.decay"})
+        if no_decay:
+            groups.append({"params": no_decay, "lr": layer_lr, "weight_decay": 0.0,
+                           "name": f"encoder.layer{layer_idx}.no_decay"})
+        grouped_ids |= {id(p) for p in decay + no_decay}
+
+    # 3) 其它 encoder 组件（pos_conv_embed / layer_norm）
+    # 这些通常靠底部，给最小 lr
+    min_lr = base_lr * (layer_decay ** (num_layers - 1))
+    for mod_name in ["pos_conv_embed", "layer_norm"]:
+        if hasattr(model.wav2vec2.encoder, mod_name):
+            decay, no_decay = [], []
+            module = getattr(model.wav2vec2.encoder, mod_name)
+            for n, p in module.named_parameters():
+                if not p.requires_grad:
+                    continue
+                (no_decay if is_no_decay(n) else decay).append(p)
+            if decay:
+                groups.append({"params": decay, "lr": min_lr, "weight_decay": weight_decay,
+                               "name": f"encoder.{mod_name}.decay"})
+            if no_decay:
+                groups.append({"params": no_decay, "lr": min_lr, "weight_decay": 0.0,
+                               "name": f"encoder.{mod_name}.no_decay"})
+            grouped_ids |= {id(p) for p in decay + no_decay}
+
+    # 4) feature_projection（投影+LN），给次低 lr
+    proj_lr = base_lr * (layer_decay ** (num_layers - 1))
+    decay, no_decay = [], []
+    for n, p in model.wav2vec2.feature_projection.named_parameters():
+        if not p.requires_grad:
+            continue
+        (no_decay if is_no_decay(n) else decay).append(p)
+    if decay:
+        groups.append({"params": decay, "lr": proj_lr, "weight_decay": weight_decay,
+                       "name": "feature_projection.decay"})
+    if no_decay:
+        groups.append({"params": no_decay, "lr": proj_lr, "weight_decay": 0.0,
+                       "name": "feature_projection.no_decay"})
+    grouped_ids |= {id(p) for p in decay + no_decay}
+
+    # 5) feature_extractor（CNN）：通常冻结；若不冻结，给最小 lr 或更小
+    if not freeze_feature_extractor:
+        fe_lr = base_lr * (layer_decay ** (num_layers + 1))  # 更小一些
+        decay, no_decay = [], []
+        for n, p in model.wav2vec2.feature_extractor.named_parameters():
+            if not p.requires_grad:
+                continue
+            (no_decay if is_no_decay(n) else decay).append(p)
+        if decay:
+            groups.append({"params": decay, "lr": fe_lr, "weight_decay": weight_decay,
+                           "name": "feature_extractor.decay"})
+        if no_decay:
+            groups.append({"params": no_decay, "lr": fe_lr, "weight_decay": 0.0,
+                           "name": "feature_extractor.no_decay"})
+        grouped_ids |= {id(p) for p in decay + no_decay}
+
+    # 6) 兜底：任何遗漏但可训练的参数（一般不会有）
+    decay, no_decay = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad or id(p) in grouped_ids:
+            continue
+        (no_decay if is_no_decay(n) else decay).append(p)
+    if decay:
+        groups.append({"params": decay, "lr": base_lr, "weight_decay": weight_decay, "name": "other.decay"})
+    if no_decay:
+        groups.append({"params": no_decay, "lr": base_lr, "weight_decay": 0.0, "name": "other.no_decay"})
+
+    return groups
+
+
 class FreezeEncoderCallback(TrainerCallback):
     """
     Callback to handle progressive unfreezing of encoder.
     First warmup the CTC layer for freeze_encoder_steps, then unfreeze encoder.
     """
     
-    def __init__(self, freeze_encoder_steps: int, model):
+    def __init__(self, freeze_encoder_steps: int, model, trainer=None):
         self.freeze_encoder_steps = freeze_encoder_steps
         self.model = model
+        self.trainer = trainer
         self.encoder_frozen = freeze_encoder_steps > 0
+        self.stage_b_start_step = None  # Track when Stage B starts
         
         if self.encoder_frozen:
-            # Initially freeze encoder
-            self.model.freeze_feature_encoder()
+            # Initially freeze encoder (Stage A: CTC warmup)
+            for param in self.model.wav2vec2.parameters():
+                param.requires_grad = False
+            for param in self.model.lm_head.parameters():
+                param.requires_grad = True
+            logger.info("Stage A: Freezing encoder, training CTC head only")
     
     def on_step_end(self, args, state, control, **kwargs):
         if self.encoder_frozen and state.global_step >= self.freeze_encoder_steps:
-            # Unfreeze encoder after warmup steps
-            for param in self.model.wav2vec2.feature_extractor.parameters():
+            # Stage B: Unfreeze encoder and rebuild optimizer
+            logger.info(f"\nStage B: Unfreezing encoder at step {state.global_step}")
+            
+            # Record when Stage B starts
+            self.stage_b_start_step = state.global_step
+            
+            # Unfreeze encoder layers
+            for param in self.model.wav2vec2.parameters():
                 param.requires_grad = True
-            for param in self.model.wav2vec2.feature_projection.parameters():
-                param.requires_grad = True
-            for param in self.model.wav2vec2.encoder.parameters():
-                param.requires_grad = True
+            
+            # Rebuild optimizer and scheduler
+            if self.trainer and hasattr(kwargs.get('trainer', None), 'optimizer'):
+                trainer = kwargs['trainer']
+                # Store Stage B start step in trainer for scheduler creation
+                trainer.stage_b_start_step = self.stage_b_start_step
+                # Reset optimizer and scheduler to trigger recreation
+                trainer.optimizer = None
+                trainer.lr_scheduler = None
+                # Create new optimizer with updated parameter groups
+                trainer.create_optimizer()
+                # Create new scheduler for Stage B
+                trainer.create_scheduler(trainer.args.max_steps - self.stage_b_start_step, trainer.optimizer)
+                logger.info("Optimizer and scheduler rebuilt for Stage B")
+            
             self.encoder_frozen = False
-            print(f"\nUnfreezing encoder at step {state.global_step}")
         return control
 
 
 class CTCTrainer(Trainer):
     """
-    Custom trainer that logs predictions during evaluation.
+    Custom trainer that logs predictions during evaluation and supports layer-wise learning rate decay.
     """
     
-    def __init__(self, *args, num_examples_to_log=5, **kwargs):
+    def __init__(self, *args, num_examples_to_log=5, use_layerwise_lr_decay=True, freeze_encoder_steps=0, **kwargs):
         super().__init__(*args, **kwargs)
         self.num_examples_to_log = num_examples_to_log
         self.eval_predictions = None
         self.eval_labels = None
+        self.use_layerwise_lr_decay = use_layerwise_lr_decay
+        self.freeze_encoder_steps = freeze_encoder_steps
+        self.stage_b_start_step = None  # Will be set by callback
     
     def compute_metrics(self, eval_pred):
         """Override to store predictions for logging."""
@@ -386,6 +540,106 @@ class CTCTrainer(Trainer):
                     })
         
         return metrics
+    
+    def create_optimizer(self):
+        """
+        Override to create optimizer with layer-wise learning rate decay.
+        """
+        if self.optimizer is None:
+            if self.use_layerwise_lr_decay:
+                # Check if encoder is frozen (Stage A: CTC warmup)
+                encoder_frozen = not any(p.requires_grad for p in self.model.wav2vec2.encoder.parameters())
+                
+                if encoder_frozen:
+                    # Stage A: Only CTC head is trainable
+                    logger.info("Creating optimizer for Stage A (CTC warmup only)")
+                    parameter_groups = get_parameter_groups(
+                        self.model,
+                        base_lr=1e-4,
+                        layer_decay=0.95,
+                        ctc_lr=5e-4,  # Higher LR for CTC during warmup
+                        weight_decay=0.01,
+                        freeze_feature_extractor=True
+                    )
+                else:
+                    # Stage B: Full model fine-tuning with LLRD
+                    logger.info("Creating optimizer for Stage B (full model with LLRD)")
+                    parameter_groups = get_parameter_groups(
+                        self.model,
+                        base_lr=1e-4,
+                        layer_decay=0.95,
+                        ctc_lr=3e-4,
+                        weight_decay=0.01,
+                        freeze_feature_extractor=True  # Keep CNN frozen
+                    )
+                
+                # Log parameter groups
+                logger.info("Parameter groups created:")
+                for group in parameter_groups:
+                    num_params = sum(p.numel() for p in group['params'])
+                    logger.info(f"  {group['name']}: {num_params:,} params, lr={group['lr']:.2e}, wd={group['weight_decay']}")
+                
+                # Create AdamW optimizer
+                self.optimizer = AdamW(
+                    parameter_groups,
+                    betas=(0.9, 0.98),
+                    eps=1e-8
+                )
+            else:
+                # Fall back to default optimizer creation
+                return super().create_optimizer()
+        
+        return self.optimizer
+    
+    def create_scheduler(self, num_training_steps: int, optimizer: torch.optim.Optimizer = None):
+        """
+        Override to create appropriate scheduler for each stage with independent warmup.
+        """
+        if self.lr_scheduler is None:
+            if optimizer is None:
+                optimizer = self.optimizer
+            
+            # Check if we're in Stage A or Stage B
+            encoder_frozen = not any(p.requires_grad for p in self.model.wav2vec2.encoder.parameters())
+            
+            if encoder_frozen:
+                # Stage A: CTC warmup
+                # Use 10% of Stage A steps for warmup
+                warmup_steps = int(self.freeze_encoder_steps * 0.1)
+                logger.info(f"Creating Stage A scheduler: linear warmup for {warmup_steps} steps, total {self.freeze_encoder_steps} steps")
+                
+                self.lr_scheduler = get_linear_schedule_with_warmup(
+                    optimizer,
+                    num_warmup_steps=warmup_steps,
+                    num_training_steps=self.freeze_encoder_steps
+                )
+            else:
+                # Stage B: Full model training
+                # Calculate remaining steps after Stage A
+                if hasattr(self, 'stage_b_start_step') and self.stage_b_start_step is not None:
+                    stage_b_steps = self.args.max_steps - self.stage_b_start_step
+                else:
+                    # If called directly without Stage A
+                    stage_b_steps = num_training_steps
+                
+                # Use 10% of Stage B steps for warmup
+                warmup_steps = int(stage_b_steps * 0.1)
+                logger.info(f"Creating Stage B scheduler: {'cosine' if self.args.lr_scheduler_type == 'cosine' else 'linear'} warmup for {warmup_steps} steps, total {stage_b_steps} steps")
+                
+                if self.args.lr_scheduler_type == "cosine":
+                    self.lr_scheduler = get_cosine_schedule_with_warmup(
+                        optimizer,
+                        num_warmup_steps=warmup_steps,
+                        num_training_steps=stage_b_steps
+                    )
+                else:
+                    self.lr_scheduler = get_linear_schedule_with_warmup(
+                        optimizer,
+                        num_warmup_steps=warmup_steps,
+                        num_training_steps=stage_b_steps
+                    )
+        
+        return self.lr_scheduler
 
 
 @dataclass
@@ -896,8 +1150,10 @@ def main():
 
     # Set up callbacks
     callbacks = []
+    freeze_callback = None
     if model_args.freeze_encoder_steps > 0:
-        callbacks.append(FreezeEncoderCallback(model_args.freeze_encoder_steps, model))
+        freeze_callback = FreezeEncoderCallback(model_args.freeze_encoder_steps, model)
+        callbacks.append(freeze_callback)
 
     # Initialize our custom Trainer with prediction logging
     trainer = CTCTrainer(
@@ -910,7 +1166,13 @@ def main():
         tokenizer=feature_extractor,
         callbacks=callbacks,
         num_examples_to_log=data_args.num_examples_to_log,
+        use_layerwise_lr_decay=True,  # Enable layer-wise learning rate decay
+        freeze_encoder_steps=model_args.freeze_encoder_steps,  # Pass freeze steps to trainer
     )
+    
+    # Set trainer reference in callback for optimizer rebuilding
+    if freeze_callback:
+        freeze_callback.trainer = trainer
 
     # Training
     if training_args.do_train:
