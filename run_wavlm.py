@@ -34,6 +34,7 @@ from transformers import (
     TrainingArguments,
     set_seed,
     TrainerCallback,
+    EarlyStoppingCallback,
     ProcessorMixin,
     PretrainedConfig,
     get_linear_schedule_with_warmup,
@@ -502,10 +503,10 @@ class CTCTrainer(Trainer):
         # Call the original compute_metrics
         metrics = self.compute_metrics_fn(eval_pred) if self.compute_metrics_fn is not None else {}
         
-        # Extract and log predictions
-        if "pred_str" in metrics and "label_str" in metrics:
-            self.eval_predictions = metrics.pop("pred_str")
-            self.eval_labels = metrics.pop("label_str")
+        # Extract predictions from function attributes if available
+        if hasattr(self.compute_metrics_fn, 'pred_str') and hasattr(self.compute_metrics_fn, 'label_str'):
+            self.eval_predictions = self.compute_metrics_fn.pred_str
+            self.eval_labels = self.compute_metrics_fn.label_str
             
             # Log sample predictions
             if is_main_process(self.args.local_rank):
@@ -834,6 +835,10 @@ class DataTrainingArguments:
         default=5,
         metadata={"help": "Number of prediction examples to log during evaluation."}
     )
+    early_stopping_patience: Optional[int] = field(
+        default=None,
+        metadata={"help": "Number of evaluation calls with no improvement after which training will be stopped."}
+    )
 
 
 @dataclass
@@ -879,23 +884,16 @@ class DataCollatorCTCWithPadding:
 
 
 def load_cgn_data(data_dir: str, split: str) -> Dataset:
-    """Load CGN data from parquet files."""
+    """Load CGN data from parquet files without materializing the whole split in RAM."""
     parquet_files = sorted(Path(data_dir).glob(f"{split}-*.parquet"))
     
     if not parquet_files:
         raise ValueError(f"No parquet files found for split '{split}' in {data_dir}")
     
-    # Read all parquet files for this split
-    dfs = []
-    for file in parquet_files:
-        df = pd.read_parquet(file)
-        dfs.append(df)
-    
-    # Concatenate all dataframes
-    full_df = pd.concat(dfs, ignore_index=True)
-    
-    # Convert to HuggingFace Dataset
-    dataset = Dataset.from_pandas(full_df)
+    # Use HuggingFace datasets parquet loader (memory-mapped Arrow) instead of pandas concat
+    data_files = [str(p) for p in parquet_files]
+    ds_dict = datasets.load_dataset("parquet", data_files={"data": data_files})
+    dataset = ds_dict["data"]
     
     return dataset
 
@@ -1145,8 +1143,12 @@ def main():
 
         wer = wer_metric.compute(predictions=pred_str, references=label_str)
 
-        # Return metrics - note that pred_str and label_str will be logged by callback
-        return {"wer": wer, "pred_str": pred_str, "label_str": label_str}
+        # Store predictions for logging by CTCTrainer
+        # Don't return them in metrics to avoid logging format errors
+        compute_metrics.pred_str = pred_str
+        compute_metrics.label_str = label_str
+
+        return {"wer": wer}
 
     # Set up callbacks
     callbacks = []
@@ -1154,6 +1156,14 @@ def main():
     if model_args.freeze_encoder_steps > 0:
         freeze_callback = FreezeEncoderCallback(model_args.freeze_encoder_steps, model)
         callbacks.append(freeze_callback)
+    
+    # Add early stopping callback if patience is specified
+    if data_args.early_stopping_patience is not None and data_args.early_stopping_patience > 0:
+        early_stopping_callback = EarlyStoppingCallback(
+            early_stopping_patience=data_args.early_stopping_patience
+        )
+        callbacks.append(early_stopping_callback)
+        logger.info(f"Early stopping enabled with patience={data_args.early_stopping_patience}")
 
     # Initialize our custom Trainer with prediction logging
     trainer = CTCTrainer(
