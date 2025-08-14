@@ -905,9 +905,20 @@ def main():
     # Metrics
     wer_metric = evaluate.load("wer", cache_dir=model_args.cache_dir)
 
+    def preprocess_logits_for_metrics(logits, labels):
+        # logits can be a tuple when using some models (e.g., with past_key_values)
+        if isinstance(logits, tuple):
+            logits = logits[0]
+        # Return argmax over vocabulary dimension to drastically reduce memory during accumulation
+        return logits.argmax(dim=-1)
+
     def compute_metrics(pred):
-        pred_logits = pred.predictions
-        pred_ids = np.argmax(pred_logits, axis=-1)
+        # pred.predictions can be either full logits (ndim==3) or already argmaxed ids (ndim==2)
+        pred_array = pred.predictions
+        if isinstance(pred_array, np.ndarray) and pred_array.ndim == 3:
+            pred_ids = np.argmax(pred_array, axis=-1)
+        else:
+            pred_ids = pred_array
 
         pred.label_ids[pred.label_ids == -100] = tokenizer.pad_token_id
 
@@ -952,6 +963,7 @@ def main():
         num_examples_to_log=data_args.num_examples_to_log,
         use_layerwise_lr_decay=True,  # Enable layer-wise learning rate decay
         freeze_encoder_steps=model_args.freeze_encoder_steps,  # Pass freeze steps to trainer
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics,
     )
     
     # Set trainer reference in callback for optimizer rebuilding
