@@ -131,8 +131,6 @@ def get_whisper_parameter_groups(
     # 1) LM head (输出层)
     decay, no_decay = [], []
     for n, p in model.proj_out.named_parameters():
-        if not p.requires_grad:
-            continue
         (no_decay if is_no_decay(n) else decay).append(p)
     if decay:
         groups.append({"params": decay, "lr": lm_head_lr, "weight_decay": weight_decay, "name": "lm_head.decay"})
@@ -147,8 +145,6 @@ def get_whisper_parameter_groups(
         layer_lr = decoder_base_lr * (layer_decay ** (num_decoder_layers - 1 - layer_idx))
         decay, no_decay = [], []
         for n, p in layer.named_parameters():
-            if not p.requires_grad:
-                continue
             (no_decay if is_no_decay(n) else decay).append(p)
         if decay:
             groups.append({"params": decay, "lr": layer_lr, "weight_decay": weight_decay,
@@ -168,7 +164,7 @@ def get_whisper_parameter_groups(
                 continue
             decay, no_decay = [], []
             for n, p in comp.named_parameters():
-                if not p.requires_grad or id(p) in grouped_ids:
+                if id(p) in grouped_ids:
                     continue
                 (no_decay if is_no_decay(n) else decay).append(p)
             if decay:
@@ -185,8 +181,6 @@ def get_whisper_parameter_groups(
         layer_lr = encoder_base_lr * (layer_decay ** (num_encoder_layers - 1 - layer_idx))
         decay, no_decay = [], []
         for n, p in layer.named_parameters():
-            if not p.requires_grad:
-                continue
             (no_decay if is_no_decay(n) else decay).append(p)
         if decay:
             groups.append({"params": decay, "lr": layer_lr, "weight_decay": weight_decay,
@@ -205,8 +199,6 @@ def get_whisper_parameter_groups(
                 continue
             decay, no_decay = [], []
             for n, p in comp.named_parameters():
-                if not p.requires_grad:
-                    continue
                 (no_decay if is_no_decay(n) else decay).append(p)
             if decay:
                 groups.append({"params": decay, "lr": min_encoder_lr, "weight_decay": weight_decay,
@@ -219,7 +211,7 @@ def get_whisper_parameter_groups(
     # 6) 兜底：任何遗漏的可训练参数
     decay, no_decay = [], []
     for n, p in model.named_parameters():
-        if not p.requires_grad or id(p) in grouped_ids:
+        if id(p) in grouped_ids:
             continue
         (no_decay if is_no_decay(n) else decay).append(p)
     if decay:
@@ -258,7 +250,7 @@ class FreezeEncoderCallback(TrainerCallback):
     
     def on_step_end(self, args, state, control, **kwargs):
         if self.encoder_frozen and state.global_step >= self.freeze_encoder_steps:
-            # Stage B: Unfreeze encoder and rebuild optimizer
+            # Stage B: Unfreeze encoder and rebuild scheduler
             logger.info(f"\nStage B: Unfreezing encoder at step {state.global_step}")
             
             # Record when Stage B starts
@@ -268,19 +260,38 @@ class FreezeEncoderCallback(TrainerCallback):
             for param in self.model.model.encoder.parameters():
                 param.requires_grad = True
             
-            # Rebuild optimizer and scheduler
-            if self.trainer and hasattr(kwargs.get('trainer', None), 'optimizer'):
-                trainer = kwargs['trainer']
-                # Store Stage B start step in trainer for scheduler creation
-                trainer.stage_b_start_step = self.stage_b_start_step
-                # Reset optimizer and scheduler to trigger recreation
-                trainer.optimizer = None
-                trainer.lr_scheduler = None
-                # Create new optimizer with updated parameter groups
-                trainer.create_optimizer()
-                # Create new scheduler for Stage B
-                trainer.create_scheduler(trainer.args.max_steps - self.stage_b_start_step, trainer.optimizer)
-                logger.info("Optimizer and scheduler rebuilt for Stage B")
+            # Adjust decoder and lm_head LRs for Stage B
+            if self.trainer and self.trainer.optimizer:
+                for group in self.trainer.optimizer.param_groups:
+                    name = group.get("name", "")
+                    if isinstance(name, str):
+                        if name.startswith("decoder."):
+                            # Reduce decoder LR for Stage B
+                            if "layer" in name:
+                                # Extract layer index and recalculate with Stage B lr
+                                layer_idx = int(name.split("layer")[1].split(".")[0])
+                                num_decoder_layers = len(self.model.model.decoder.layers)
+                                group["lr"] = 1e-4 * (0.95 ** (num_decoder_layers - 1 - layer_idx))
+                            else:
+                                # Decoder components
+                                group["lr"] = 1e-4 * (0.95 ** (len(self.model.model.decoder.layers) - 1))
+                        elif name.startswith("lm_head."):
+                            # Keep lm_head LR unchanged
+                            pass
+            
+            # Rebuild scheduler for remaining steps
+            if self.trainer and self.trainer.optimizer:
+                # Calculate remaining steps for Stage B
+                remaining_steps = self.trainer.args.max_steps - self.stage_b_start_step
+                
+                if remaining_steps > 0:
+                    # Store Stage B start step and rebuild only the scheduler
+                    self.trainer.stage_b_start_step = self.stage_b_start_step
+                    self.trainer.lr_scheduler = None
+                    self.trainer.create_scheduler(remaining_steps, self.trainer.optimizer)
+                    logger.info(f"Encoder unfrozen, scheduler rebuilt for Stage B with {remaining_steps} remaining steps")
+                else:
+                    logger.warning(f"No remaining steps for Stage B training")
             
             self.encoder_frozen = False
         return control
@@ -347,34 +358,27 @@ class WhisperSeq2SeqTrainer(Seq2SeqTrainer):
     def create_optimizer(self):
         """
         Override to create optimizer with layer-wise learning rate decay for Whisper.
+        Always creates full parameter groups, adjusting LRs based on stage.
         """
         if self.optimizer is None:
             if self.use_layerwise_lr_decay:
-                # Check if encoder is frozen (Stage A: Decoder warmup)
+                # Check if we're in Stage A (encoder frozen)
                 encoder_frozen = not any(p.requires_grad for p in self.model.model.encoder.parameters())
                 
-                if encoder_frozen:
-                    # Stage A: Decoder warmup - only decoder + lm_head trainable
-                    logger.info("Creating optimizer for Stage A (Decoder warmup)")
-                    parameter_groups = get_whisper_parameter_groups(
-                        self.model,
-                        encoder_base_lr=3e-5,  # Won't be used since encoder is frozen
-                        decoder_base_lr=3e-4,  # Higher LR for decoder during warmup
-                        lm_head_lr=3e-4,       # Same high LR for lm_head
-                        layer_decay=0.95,
-                        weight_decay=0.01
-                    )
-                else:
-                    # Stage B: Full model fine-tuning with LLRD
-                    logger.info("Creating optimizer for Stage B (full model with LLRD)")
-                    parameter_groups = get_whisper_parameter_groups(
-                        self.model,
-                        encoder_base_lr=3e-5,  # Lower LR for encoder
-                        decoder_base_lr=1e-4,  # Normal LR for decoder
-                        lm_head_lr=3e-4,       # Higher LR for lm_head
-                        layer_decay=0.95,
-                        weight_decay=0.01
-                    )
+                # Always create full parameter groups
+                logger.info(f"Creating optimizer with all parameter groups (Stage {'A' if encoder_frozen else 'B'})")
+                
+                # Get all parameter groups
+                parameter_groups = get_whisper_parameter_groups(
+                    self.model,
+                    encoder_base_lr=3e-5,  # Encoder LR for Stage B
+                    decoder_base_lr=3e-4 if encoder_frozen else 1e-4,  # Different decoder lr for stages
+                    lm_head_lr=3e-4,       # LM head LR
+                    layer_decay=0.95,
+                    weight_decay=0.01
+                )
+                
+                # No need to adjust encoder LRs - they won't update due to requires_grad=False
                 
                 # Log parameter groups
                 logger.info("Parameter groups created:")
@@ -408,14 +412,15 @@ class WhisperSeq2SeqTrainer(Seq2SeqTrainer):
             
             if encoder_frozen:
                 # Stage A: Decoder warmup
-                # Use 10% of Stage A steps for warmup (300 steps for 3000 total)
-                warmup_steps = int(self.freeze_encoder_steps * 0.1)
-                logger.info(f"Creating Stage A scheduler: linear warmup for {warmup_steps} steps, total {self.freeze_encoder_steps} steps")
+                # Use 10% of Stage A steps for warmup
+                stage_a_steps = self.freeze_encoder_steps if self.freeze_encoder_steps > 0 else num_training_steps
+                warmup_steps = max(1, int(stage_a_steps * 0.2))
+                logger.info(f"Creating Stage A scheduler: linear warmup for {warmup_steps} steps, total {stage_a_steps} steps")
                 
                 self.lr_scheduler = get_linear_schedule_with_warmup(
                     optimizer,
                     num_warmup_steps=warmup_steps,
-                    num_training_steps=self.freeze_encoder_steps
+                    num_training_steps=stage_a_steps
                 )
             else:
                 # Stage B: Full model training
