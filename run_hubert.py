@@ -262,10 +262,14 @@ class FreezeEncoderCallback(TrainerCallback):
             
             # Adjust CTC head LR for Stage B (keep encoder LRs as created)
             if self.trainer and self.trainer.optimizer:
+                # Get model arguments to access Stage B CTC lr
+                model_args = self.trainer.args.model_args if hasattr(self.trainer.args, 'model_args') else None
+                ctc_lr_stage_b = model_args.ctc_lr_stage_b if model_args else 3e-4
+                
                 for group in self.trainer.optimizer.param_groups:
                     name = group.get("name", "")
                     if isinstance(name, str) and name.startswith("ctc_head."):
-                        group["lr"] = 3e-4
+                        group["lr"] = ctc_lr_stage_b
             
             # Rebuild scheduler for remaining steps
             if self.trainer and self.trainer.optimizer:
@@ -363,11 +367,18 @@ class CTCTrainer(Trainer):
                 
                 # Use Stage A CTC lr initially, will naturally transition in Stage B
                 # Encoder params won't update in Stage A due to requires_grad=False
+                # Get model arguments to access learning rate settings
+                model_args = self.args.model_args if hasattr(self.args, 'model_args') else None
+                encoder_lr = model_args.encoder_lr if model_args else 5e-5
+                ctc_lr_stage_a = model_args.ctc_lr_stage_a if model_args else 5e-4
+                ctc_lr_stage_b = model_args.ctc_lr_stage_b if model_args else 3e-4
+                layer_decay = model_args.layer_decay if model_args else 0.9
+                
                 parameter_groups = get_parameter_groups(
                     self.model,
-                    base_lr=1e-4,          # Encoder LR (won't be used in Stage A due to requires_grad)
-                    layer_decay=0.95,      # LLRD for encoder layers
-                    ctc_lr=5e-4 if encoder_frozen else 3e-4,  # Higher LR for CTC in Stage A
+                    base_lr=encoder_lr,          # Encoder LR (won't be used in Stage A due to requires_grad)
+                    layer_decay=layer_decay,      # LLRD for encoder layers
+                    ctc_lr=ctc_lr_stage_a if encoder_frozen else ctc_lr_stage_b,  # Higher LR for CTC in Stage A
                     weight_decay=0.01,
                     freeze_feature_extractor=True
                 )
@@ -403,9 +414,18 @@ class CTCTrainer(Trainer):
             
             if encoder_frozen:
                 # Stage A: CTC warmup
-                # Use 10% of Stage A steps for warmup
                 stage_a_steps = self.freeze_encoder_steps if self.freeze_encoder_steps > 0 else num_training_steps
-                warmup_steps = max(1, int(stage_a_steps * 0.2))
+                
+                # Get model arguments to access warmup settings
+                model_args = self.args.model_args if hasattr(self.args, 'model_args') else None
+                if model_args and model_args.warmup_steps_stage_a > 0:
+                    # Use absolute warmup steps if specified
+                    warmup_steps = min(model_args.warmup_steps_stage_a, stage_a_steps)
+                else:
+                    # Use warmup ratio
+                    warmup_ratio = model_args.warmup_ratio_stage_a if model_args else 0.2
+                    warmup_steps = max(1, int(stage_a_steps * warmup_ratio))
+                
                 logger.info(f"Creating Stage A scheduler: linear warmup for {warmup_steps} steps, total {stage_a_steps} steps")
                 
                 self.lr_scheduler = get_linear_schedule_with_warmup(
@@ -422,8 +442,16 @@ class CTCTrainer(Trainer):
                     # If called directly without Stage A
                     stage_b_steps = num_training_steps
                 
-                # Use 10% of Stage B steps for warmup
-                warmup_steps = int(stage_b_steps * 0.1)
+                # Get model arguments to access warmup settings
+                model_args = self.args.model_args if hasattr(self.args, 'model_args') else None
+                if model_args and model_args.warmup_steps_stage_b > 0:
+                    # Use absolute warmup steps if specified
+                    warmup_steps = min(model_args.warmup_steps_stage_b, stage_b_steps)
+                else:
+                    # Use warmup ratio
+                    warmup_ratio = model_args.warmup_ratio_stage_b if model_args else 0.2
+                    warmup_steps = int(stage_b_steps * warmup_ratio)
+                
                 logger.info(f"Creating Stage B scheduler: {'cosine' if self.args.lr_scheduler_type == 'cosine' else 'linear'} warmup for {warmup_steps} steps, total {stage_b_steps} steps")
                 
                 if self.args.lr_scheduler_type == "cosine":
@@ -524,6 +552,38 @@ class ModelArguments:
     freeze_encoder_steps: int = field(
         default=0,
         metadata={"help": "Number of steps to warm up CTC layer before unfreezing encoder. 0 means no warmup."}
+    )
+    encoder_lr: float = field(
+        default=5e-5,
+        metadata={"help": "Learning rate for encoder top layer in Stage B."}
+    )
+    ctc_lr_stage_a: float = field(
+        default=5e-4,
+        metadata={"help": "Learning rate for CTC head in Stage A (warmup phase)."}
+    )
+    ctc_lr_stage_b: float = field(
+        default=3e-4,
+        metadata={"help": "Learning rate for CTC head in Stage B (full model training)."}
+    )
+    layer_decay: float = field(
+        default=0.9,
+        metadata={"help": "Layer-wise learning rate decay factor for LLRD."}
+    )
+    warmup_ratio_stage_a: float = field(
+        default=0.2,
+        metadata={"help": "Warmup ratio for Stage A (CTC warmup phase). Set to 0 to use warmup_steps_stage_a instead."}
+    )
+    warmup_steps_stage_a: int = field(
+        default=500,
+        metadata={"help": "Number of warmup steps for Stage A. If > 0, overrides warmup_ratio_stage_a."}
+    )
+    warmup_ratio_stage_b: float = field(
+        default=0.2,
+        metadata={"help": "Warmup ratio for Stage B (full model training). Set to 0 to use warmup_steps_stage_b instead."}
+    )
+    warmup_steps_stage_b: int = field(
+        default=5000,
+        metadata={"help": "Number of warmup steps for Stage B. If > 0, overrides warmup_ratio_stage_b."}
     )
 
 
@@ -839,6 +899,10 @@ def main():
     # Freeze feature encoder if requested
     if model_args.freeze_feature_encoder:
         model.freeze_feature_encoder()
+    
+    # Make CTCLoss robust against invalid alignment (avoid inf -> NaN)
+    model.config.ctc_zero_infinity = True
+    logger.info(f"CTC zero_infinity set to: {model.config.ctc_zero_infinity}")
 
     # Preprocessing the datasets
     def prepare_dataset(batch):
@@ -951,6 +1015,9 @@ def main():
         )
         callbacks.append(early_stopping_callback)
         logger.info(f"Early stopping enabled with patience={data_args.early_stopping_patience}")
+    
+    # Store model_args in training_args for access in trainer
+    training_args.model_args = model_args
     
     # Initialize our custom Trainer with prediction logging
     trainer = CTCTrainer(
