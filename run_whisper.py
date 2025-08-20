@@ -267,11 +267,15 @@ class FreezeEncoderCallback(TrainerCallback):
                     if isinstance(name, str):
                         if name.startswith("decoder."):
                             # Reduce decoder LR for Stage B
-                            if "layer" in name:
+                            if "layer" in name and not name.endswith("layer_norm"):
                                 # Extract layer index and recalculate with Stage B lr
-                                layer_idx = int(name.split("layer")[1].split(".")[0])
-                                num_decoder_layers = len(self.model.model.decoder.layers)
-                                group["lr"] = 1e-4 * (0.95 ** (num_decoder_layers - 1 - layer_idx))
+                                try:
+                                    layer_idx = int(name.split("layer")[1].split(".")[0])
+                                    num_decoder_layers = len(self.model.model.decoder.layers)
+                                    group["lr"] = 1e-4 * (0.95 ** (num_decoder_layers - 1 - layer_idx))
+                                except (ValueError, IndexError):
+                                    # If parsing fails, treat as decoder component
+                                    group["lr"] = 1e-4 * (0.95 ** (len(self.model.model.decoder.layers) - 1))
                             else:
                                 # Decoder components
                                 group["lr"] = 1e-4 * (0.95 ** (len(self.model.model.decoder.layers) - 1))
@@ -720,7 +724,7 @@ class DataCollatorSpeechSeq2SeqWithPadding:
             labels = labels[:, 1:]
 
         batch["labels"] = labels
-
+        
         return batch
 
 
