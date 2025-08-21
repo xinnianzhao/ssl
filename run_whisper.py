@@ -921,12 +921,13 @@ def main():
         decoder_start_token_id=model.config.decoder_start_token_id,
         num_beams=training_args.generation_num_beams,
         max_length=training_args.generation_max_length,
-        early_stopping=True,
-        length_penalty=1.0,
-        repetition_penalty=1.0,
-        no_repeat_ngram_size=3,
     )
-        # Create custom processor with both feature extractor and tokenizer
+        # early_stopping=True,
+        # length_penalty=1.0,
+        # repetition_penalty=1.0,
+        # no_repeat_ngram_size=3,
+
+    # Create custom processor with both feature extractor and tokenizer
     processor = CustomProcessor(feature_extractor=feature_extractor, tokenizer=tokenizer)
     
     # 6. Preprocessing the datasets
