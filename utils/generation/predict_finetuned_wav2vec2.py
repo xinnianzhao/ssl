@@ -123,7 +123,11 @@ def main():
     model = Wav2Vec2ForCTC.from_pretrained(args.model_dir)
     
     # Load processor (feature extractor + custom tokenizer)
-    processor = CustomProcessor.from_pretrained(os.path.dirname(args.model_dir))
+    # Check if vocab.json is in the model directory
+    if os.path.exists(os.path.join(args.model_dir, "vocab.json")):
+        processor = CustomProcessor.from_pretrained(args.model_dir)
+    else:
+        processor = CustomProcessor.from_pretrained(os.path.dirname(args.model_dir))
     
     # Move model to GPU if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
