@@ -39,14 +39,14 @@ def parse_args():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=8,
+        default=16,
         help="Batch size for inference"
     )
     
     parser.add_argument(
         "--num_beams",
         type=int,
-        default=5,
+        default=3,
         help="Number of beams for beam search"
     )
     
@@ -154,7 +154,8 @@ def main():
                 max_length=args.max_length,
                 num_beams=args.num_beams,
                 temperature=0.0,  # Deterministic generation
-                do_sample=False
+                do_sample=False,
+                return_timestamps=False
             )
             
             # Decode predictions
@@ -165,7 +166,7 @@ def main():
                 speech_id = speech_ids[j]
                 prediction = batch_predictions[j].strip()
                 label = transcriptions[j].strip()
-                
+                # print(f"Speech ID: {speech_id} {prediction}")
                 predictions.append(f"{speech_id} {prediction}")
                 labels.append(f"{speech_id} {label}")
     
